@@ -15,8 +15,8 @@ import scala.util.{Failure, Success}
   *   - Keys are plain Avro-encoded bytes, not TileKey-wrapped Thrift — so doQueryLookups
   *     must skip TileKey deserialization and query by raw partition key + sort key range directly.
   */
-class DynamoDBStatsKVStoreImpl(dynamoDbClient: DynamoDbAsyncClient, conf: Map[String, String] = Map.empty)
-    extends DynamoDBKVStoreImpl(dynamoDbClient, conf) {
+class DynamoDBStatsKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[String, String] = Map.empty)
+    extends DynamoDBKVStoreImpl(rawDynamoDbClient, conf) {
 
   override protected val enableTtl: Boolean = false
 
@@ -28,8 +28,8 @@ class DynamoDBStatsKVStoreImpl(dynamoDbClient: DynamoDbAsyncClient, conf: Map[St
   override protected def doGetLookups(getLookups: Seq[GetRequest]): Seq[Future[GetResponse]] = {
     val defaultTimestamp = Instant.now().toEpochMilli
     getLookups.map { req =>
-      val resolvedDataset = resolveTableName(req.dataset)
-      queryPartitionOnly(resolvedDataset, req.keyBytes)
+      val tableInfo = resolveBatchTableInfo(req.dataset)
+      queryPartitionOnly(tableInfo.physicalTableName, req.keyBytes)
         .transform {
           case Success(response) =>
             val timedValues = extractTimedValues(response.items(), defaultTimestamp).getOrElse(Seq.empty)
@@ -44,10 +44,10 @@ class DynamoDBStatsKVStoreImpl(dynamoDbClient: DynamoDbAsyncClient, conf: Map[St
     val defaultTimestamp = Instant.now().toEpochMilli
 
     queryLookups.map { req =>
-      val resolvedDataset = resolveTableName(req.dataset)
+      val tableInfo = resolveBatchTableInfo(req.dataset)
       // Stats keys are raw Avro bytes (no TileKey wrapping), query directly by partition key
       // and sort key range — symmetric with multiPut's non-streaming write path.
-      queryPartition(resolvedDataset, req.keyBytes, req.startTsMillis.get, req.endTsMillis)
+      queryPartition(tableInfo.physicalTableName, req.keyBytes, req.startTsMillis.get, req.endTsMillis)
         .transform {
           case Success(response) =>
             val timedValues = extractTimedValues(response.items(), defaultTimestamp).getOrElse(Seq.empty)

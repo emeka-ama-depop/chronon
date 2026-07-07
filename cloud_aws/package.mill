@@ -54,6 +54,7 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
     mvn"software.amazon.awssdk:url-connection-client:2.30.13",
     mvn"software.amazon.awssdk:netty-nio-client:2.30.13",
     mvn"software.amazon.awssdk:sts:2.30.13",
+    mvn"software.amazon.dax:amazon-dax-client:2.0.10",
     mvn"software.amazon.awssdk:secretsmanager:2.30.13",
     mvn"software.amazon.awssdk:identity-spi:2.30.13",
     mvn"software.amazon.msk:aws-msk-iam-auth:2.3.5",

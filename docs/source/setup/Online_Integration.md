@@ -128,3 +128,17 @@ fetcher.setPartitionSpec("yyyyMMdd")
 ```
 
 `userConf` is captured from commandline arguments to the `run.py` script or to the `chronon-uber-jar` with `ai.chronon.spark.Driver` as the main class `-Zkey1=value1 -Zkey2=value2` becomes `{key1: value1, key2: value2}` initializer argument to the Api class. You can use that to set KVStore params, or kafka params for streaming jobs or bulk upload jobs.
+
+## AWS DynamoDB KV Options
+
+The AWS DynamoDB KV implementation accepts these optional KV args through the API constructor config, for example via `-Zkey=value` or team `commonConf` when running `upload-to-kv`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `kv.enableTtl` | `true` | Enables DynamoDB TTL on created and imported tables. |
+| `kv.enableDax` | `false` | Enables DAX for DynamoDB data-plane reads and writes when `kv.daxEndpoint` is also configured. |
+| `kv.daxEndpoint` | empty | DAX cluster endpoint such as `dax://my-cluster.example.com`. When `kv.enableDax=true` and this endpoint is configured, Chronon uses a DAX-backed DynamoDB client for `GetItem`, `Query`, and `PutItem` calls. Registry reads, table creation, and imports still use DynamoDB. |
+| `kv.tablePrefix` | empty | Prefixes DynamoDB table names used by this KV store. |
+| `kv.replicaRegions` | empty | Comma-separated replica regions to add to created/imported tables as best effort global-table replicas. |
+
+For AWS Flink streaming jobs launched through the AWS runner, `kv.*` keys from the compiled `executionInfo.conf.common` are forwarded as `-Z...` API properties. Explicit `CHRONON_ONLINE_ARGS` are appended after those generated properties, so command-line values can still override team config.

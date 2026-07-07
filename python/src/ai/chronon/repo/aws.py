@@ -29,6 +29,14 @@ ZIPLINE_AWS_FLINK_JAR_DEFAULT = "flink_assembly_deploy.jar"
 ZIPLINE_AWS_SERVICE_JAR = "service_assembly_deploy.jar"
 
 LOCAL_FILE_TO_ETAG_JSON = f"{ZIPLINE_DIRECTORY}/local_file_to_etag.json"
+FLINK_API_CONF_PREFIXES = ("kv.",)
+
+
+def _format_api_prop_value(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
 
 class AwsRunner(Runner):
     def __init__(self, args):
@@ -122,6 +130,27 @@ class AwsRunner(Runner):
         except Exception as e:
             print(f"Error comparing files: {str(e)}")
             return False
+
+    @staticmethod
+    def flink_api_props_from_conf(conf_path: str):
+        try:
+            with open(conf_path, "r") as conf_file:
+                payload = json.load(conf_file)
+        except Exception as e:
+            LOG.warning(f"Failed to read Flink API props from conf {conf_path}: {e}")
+            return {}
+
+        metadata = payload.get("metaData", payload)
+        common_conf = (
+            metadata.get("executionInfo", {})
+            .get("conf", {})
+            .get("common", {})
+        )
+        return {
+            f"-Z{key}": _format_api_prop_value(value)
+            for key, value in common_conf.items()
+            if key.startswith(FLINK_API_CONF_PREFIXES)
+        }
 
     def generate_emr_submitter_args(
         self,
@@ -230,6 +259,7 @@ class AwsRunner(Runner):
             "-ZDYNAMO_API_CALL_TIMEOUT": os.environ.get("DYNAMO_API_CALL_TIMEOUT", "PT30S"),
             "-ZDYNAMO_CONNECTION_TIMEOUT": os.environ.get("DYNAMO_CONNECTION_TIMEOUT", "PT5S"),
         }
+        user_args.update(AwsRunner.flink_api_props_from_conf(self.local_abs_conf_path))
 
         if "check-if-job-is-running" in args:
             user_args["--streaming-mode"] = "check-if-job-is-running"

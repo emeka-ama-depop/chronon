@@ -11,7 +11,9 @@ import java.util.concurrent.CompletableFuture
   * @param delegate the underlying DynamoDbAsyncClient to wrap
   * @param tablePrefix the prefix to apply to all table names
   */
-class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: String = "") {
+class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient,
+                                  tablePrefix: String = "",
+                                  dataDelegateForTableName: String => Option[DynamoDbAsyncClient] = _ => None) {
 
   private val logger = LoggerFactory.getLogger(getClass)
 
@@ -24,6 +26,9 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     tablePrefix.nonEmpty && tableName.startsWith(tablePrefix)
   }
 
+  private def dataDelegateFor(tableName: String): DynamoDbAsyncClient =
+    dataDelegateForTableName(tableName).getOrElse(delegate)
+
   // ========== Supported Read Operations ==========
 
   def getItem(request: GetItemRequest): CompletableFuture[GetItemResponse] = {
@@ -31,7 +36,7 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     val prefixedTableName = prefixTableName(originalTableName)
     logger.debug(s"getItem: original table name='$originalTableName' -> prefixed table name='$prefixedTableName'")
     val prefixedRequest = request.toBuilder.tableName(prefixedTableName).build()
-    delegate.getItem(prefixedRequest)
+    dataDelegateFor(originalTableName).getItem(prefixedRequest)
   }
 
   def query(request: QueryRequest): CompletableFuture[QueryResponse] = {
@@ -39,7 +44,7 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     val prefixedTableName = prefixTableName(originalTableName)
     logger.debug(s"query: original table name='$originalTableName' -> prefixed table name='$prefixedTableName'")
     val prefixedRequest = request.toBuilder.tableName(prefixedTableName).build()
-    delegate.query(prefixedRequest)
+    dataDelegateFor(originalTableName).query(prefixedRequest)
   }
 
   def scan(request: ScanRequest): CompletableFuture[ScanResponse] = {
@@ -70,7 +75,7 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     val prefixedTableName = prefixTableName(originalTableName)
     logger.debug(s"putItem: original table name='$originalTableName' -> prefixed table name='$prefixedTableName'")
     val prefixedRequest = request.toBuilder.tableName(prefixedTableName).build()
-    delegate.putItem(prefixedRequest)
+    dataDelegateFor(originalTableName).putItem(prefixedRequest)
   }
 
   def createTable(request: CreateTableRequest): CompletableFuture[CreateTableResponse] = {

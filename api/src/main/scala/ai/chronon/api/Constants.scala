@@ -101,6 +101,8 @@ object Constants {
 
   val KvTablePrefixArg = "kv.tablePrefix"
   val KvEnableTtlArg = "kv.enableTtl"
+  val KvEnableDaxArg = "kv.enableDax"
+  val KvDaxEndpointArg = "kv.daxEndpoint"
   val KvReplicaRegionsArg = "kv.replicaRegions"
   val ChrononSparkConfPrefix = "spark.chronon."
   val KvUploadTimeoutMsKey = "spark.chronon.kv_upload.timeout_ms"

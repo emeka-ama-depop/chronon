@@ -41,6 +41,50 @@ class PrefixedDynamoDbAsyncClientTest extends AnyFlatSpec with Matchers with Moc
     captor.getValue.tableName() shouldBe s"$testPrefix$originalTableName"
   }
 
+  it should "route data operations through a table-specific delegate" in {
+    val routedDelegate = mock[DynamoDbAsyncClient]
+    val originalTableName = "cached_table"
+    val client = new PrefixedDynamoDbAsyncClient(
+      mockDelegate,
+      testPrefix,
+      dataDelegateForTableName = tableName => if (tableName == originalTableName) Some(routedDelegate) else None
+    )
+    val request = GetItemRequest.builder().tableName(originalTableName).build()
+
+    when(routedDelegate.getItem(any[GetItemRequest]())).thenReturn(
+      CompletableFuture.completedFuture(GetItemResponse.builder().build())
+    )
+
+    client.getItem(request)
+
+    val captor = ArgumentCaptor.forClass(classOf[GetItemRequest])
+    verify(routedDelegate).getItem(captor.capture())
+    verify(mockDelegate, never()).getItem(any[GetItemRequest]())
+    captor.getValue.tableName() shouldBe s"$testPrefix$originalTableName"
+  }
+
+  it should "keep control-plane operations on the default delegate" in {
+    val routedDelegate = mock[DynamoDbAsyncClient]
+    val client = new PrefixedDynamoDbAsyncClient(
+      mockDelegate,
+      testPrefix,
+      dataDelegateForTableName = _ => Some(routedDelegate)
+    )
+    val originalTableName = "cached_table"
+    val request = CreateTableRequest.builder().tableName(originalTableName).build()
+
+    when(mockDelegate.createTable(any[CreateTableRequest]())).thenReturn(
+      CompletableFuture.completedFuture(CreateTableResponse.builder().build())
+    )
+
+    client.createTable(request)
+
+    val captor = ArgumentCaptor.forClass(classOf[CreateTableRequest])
+    verify(mockDelegate).createTable(captor.capture())
+    verify(routedDelegate, never()).createTable(any[CreateTableRequest]())
+    captor.getValue.tableName() shouldBe s"$testPrefix$originalTableName"
+  }
+
   it should "prefix table name in putItem request" in {
     val client = new PrefixedDynamoDbAsyncClient(mockDelegate, testPrefix)
     val originalTableName = "my_table"

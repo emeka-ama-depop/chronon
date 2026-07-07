@@ -1,5 +1,6 @@
 package ai.chronon.integrations.aws
 
+import ai.chronon.api.Constants.{KvDaxEndpointArg, KvEnableDaxArg}
 import ai.chronon.online.KVStore.{GetRequest, PutRequest}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -60,6 +61,20 @@ class DynamoDBBatchTableRegistryTest extends AnyFlatSpec with BeforeAndAfterAll 
 
     val resolved = kvStore.resolveTableName(logicalName)
     resolved shouldBe physicalName
+  }
+
+  it should "publish DAX endpoint in batch table registry values" in {
+    val defaultStore = new DynamoDBKVStoreImpl(client)
+    val daxStore = new DynamoDBKVStoreImpl(
+      client,
+      Map(KvEnableDaxArg -> "true", KvDaxEndpointArg -> "dax://test-cluster.example.com")
+    )
+
+    defaultStore.batchTableRegistryValue("DEFAULT_BATCH_2026_02_17") shouldBe "DEFAULT_BATCH_2026_02_17"
+    daxStore.batchTableRegistryValue("DAX_BATCH_2026_02_17") shouldBe
+      "dax://test-cluster.example.com@DAX_BATCH_2026_02_17"
+    batchTableInfoFromRegistryValue(daxStore.batchTableRegistryValue("DAX_BATCH_2026_02_17")) shouldBe
+      BatchTableInfo("DAX_BATCH_2026_02_17", Some("dax://test-cluster.example.com"))
   }
 
   it should "use dataset name directly for non-batch datasets" in {

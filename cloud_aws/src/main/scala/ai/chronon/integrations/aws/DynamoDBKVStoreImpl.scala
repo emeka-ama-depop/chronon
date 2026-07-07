@@ -2,6 +2,8 @@ package ai.chronon.integrations.aws
 
 import ai.chronon.api.Constants.{
   ContinuationKey,
+  KvDaxEndpointArg,
+  KvEnableDaxArg,
   KvEnableTtlArg,
   KvReplicaRegionsArg,
   KvTablePrefixArg,
@@ -17,16 +19,20 @@ import ai.chronon.online.KVStore._
 import ai.chronon.online.metrics.Metrics.Context
 import ai.chronon.online.metrics.{Metrics, TTLCache}
 import ai.chronon.spark.{IonPathConfig, IonWriter}
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
 import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration
 import software.amazon.awssdk.core.SdkBytes
+import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model._
+import software.amazon.dax.{ClusterDaxAsyncClient, Configuration}
 
 import java.nio.charset.Charset
 import java.time.{Duration, Instant, LocalDate}
 import java.time.format.{DateTimeFormatter, DateTimeParseException}
 import java.util
 import java.util.concurrent.{CompletableFuture, CompletionException}
+import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
 import scala.compat.java8.FutureConverters
 import scala.concurrent.duration._
@@ -38,6 +44,12 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
   import DynamoDBKVStoreConstants._
 
   protected val enableTtl: Boolean = conf.getOrElse(KvEnableTtlArg, "true").toBoolean
+  private val enableDax: Boolean = conf.getOrElse(KvEnableDaxArg, "false").toBoolean
+  private[aws] val configuredDaxEndpoint: Option[String] =
+    conf.get(KvDaxEndpointArg).filter(_.nonEmpty).filter(_ => enableDax)
+  private[aws] def daxEnabled: Boolean = configuredDaxEndpoint.nonEmpty
+  private val awsRegion: Option[String] =
+    AwsApiImpl.getOptional("AWS_DEFAULT_REGION", conf).orElse(AwsApiImpl.getOptional("AWS_REGION", conf))
 
   private val tablePrefix = conf.getOrElse(KvTablePrefixArg, "")
 
@@ -48,17 +60,51 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toList)
       .getOrElse(List.empty)
 
-  // Wrap the client to automatically prefix all table names
-  private val prefixedDynamoDbClient: PrefixedDynamoDbAsyncClient = {
+  private val daxClients = TrieMap.empty[String, DynamoDbAsyncClient]
+  private val cacheEndpointsByTable = TrieMap.empty[String, Option[String]]
+
+  // Wrap the client to automatically prefix all table names. Data-plane calls can route to DAX;
+  // metadata and control-plane calls stay on the raw DynamoDB client.
+  private[aws] lazy val dynamoDbClient: PrefixedDynamoDbAsyncClient = {
     logger.info(
-      s"Using: table prefix: '$tablePrefix' (prefix will be added to all table names used by this KVStore); enableTtl: $enableTtl")
-    new PrefixedDynamoDbAsyncClient(rawDynamoDbClient, tablePrefix)
+      s"Using: table prefix: '$tablePrefix' (prefix will be added to all table names used by this KVStore); enableTtl: $enableTtl; enableDax: $enableDax")
+    new PrefixedDynamoDbAsyncClient(rawDynamoDbClient, tablePrefix, dataDelegateForTableName = cacheEndpointForTable)
+  }
+
+  private[aws] def daxClientForEndpoint(endpoint: String): DynamoDbAsyncClient =
+    daxClients.getOrElseUpdate(
+      endpoint, {
+        logger.info(s"Creating DynamoDB DAX client for endpoint: $endpoint")
+        ClusterDaxAsyncClient
+          .builder()
+          .overrideConfiguration(daxConfiguration(endpoint))
+          .build()
+      }
+    )
+
+  if (enableDax && configuredDaxEndpoint.isEmpty) {
+    logger.warn(s"$KvEnableDaxArg is true, but $KvDaxEndpointArg is not configured; using DynamoDB")
+  }
+
+  private[aws] def daxConfiguration(endpoint: String,
+                                    credentialsProvider: Option[AwsCredentialsProvider] = None): Configuration = {
+    val builder = Configuration.builder().url(endpoint)
+    credentialsProvider.foreach(builder.credentialsProvider)
+    awsRegion.foreach { region =>
+      try {
+        builder.region(Region.of(region))
+      } catch {
+        case e: IllegalArgumentException =>
+          throw new IllegalArgumentException(s"Invalid AWS region format: $region", e)
+      }
+    }
+    builder.build()
   }
 
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("dynamodb")
 
   // TTLCache: resolves logical batch dataset names to physical date-suffixed table names
-  private val batchTableCache: TTLCache[String, String] = new TTLCache[String, String](
+  private val batchTableCache: TTLCache[String, BatchTableInfo] = new TTLCache[String, BatchTableInfo](
     f = { dataset =>
       val keyMap = Map(partitionKeyColumn -> AttributeValue.builder.b(SdkBytes.fromByteArray(dataset.getBytes)).build)
       val request = GetItemRequest.builder
@@ -66,24 +112,47 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         .key(keyMap.toJava)
         .build
 
-      val item = prefixedDynamoDbClient.getItem(request).join().item().toScala
-      item.get("valueBytes").map(v => new String(v.b().asByteArray())).getOrElse(dataset)
+      val item = dynamoDbClient.getItem(request).join().item().toScala
+      val tableInfo = item
+        .get("valueBytes")
+        .map(v => batchTableInfoFromRegistryValue(new String(v.b().asByteArray())))
+        .getOrElse(BatchTableInfo(dataset, daxEndpoint = None))
+      recordCacheEndpoint(tableInfo)
     },
     contextBuilder = { _ => metricsContext.withSuffix("batch_table_cache") }
   )
 
-  private[aws] def resolveTableName(dataset: String): String = {
-    // Use refresh() instead of apply() so the cache re-checks DynamoDB every ~8s rather than every 2hrs
+  private[aws] def resolveBatchTableInfo(dataset: String): BatchTableInfo =
     if (dataset.endsWith(batchSuffix)) batchTableCache.refresh(dataset)
-    else dataset
+    else recordCacheEndpoint(BatchTableInfo(dataset, configuredDaxEndpoint.filterNot(_ => isMetadataDataset(dataset))))
+
+  private[aws] def resolveTableName(dataset: String): String =
+    resolveBatchTableInfo(dataset).physicalTableName
+
+  private[aws] def batchTableRegistryValue(physicalTableName: String): String =
+    registryValueForBatchTable(physicalTableName, configuredDaxEndpoint)
+
+  private[aws] def isMetadataDataset(dataset: String): Boolean =
+    dataset == Constants.MetadataDataset || dataset == batchTableRegistry
+
+  private[aws] def isCacheEligible(dataset: String): Boolean =
+    resolveBatchTableInfo(dataset).daxEndpoint.nonEmpty && !isMetadataDataset(dataset)
+
+  private def recordCacheEndpoint(tableInfo: BatchTableInfo): BatchTableInfo = {
+    cacheEndpointsByTable.put(tableInfo.physicalTableName, tableInfo.daxEndpoint)
+    tableInfo
   }
+
+  private def cacheEndpointForTable(tableName: String): Option[DynamoDbAsyncClient] =
+    if (isMetadataDataset(tableName)) None
+    else cacheEndpointsByTable.get(tableName).getOrElse(configuredDaxEndpoint).map(daxClientForEndpoint)
 
   override def create(dataset: String): Unit = create(dataset, Map.empty)
 
   private def tableExists(dataset: String): Boolean = {
     val request = DescribeTableRequest.builder.tableName(dataset).build
     try {
-      prefixedDynamoDbClient.describeTable(request).join()
+      dynamoDbClient.describeTable(request).join()
       true
     } catch {
       case _: ResourceNotFoundException                                                 => false
@@ -122,8 +191,8 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
     logger.info(s"Triggering creation of DynamoDb table: $dataset with prefix '$tablePrefix' added later")
     try {
-      prefixedDynamoDbClient.createTable(request).join()
-      val waiterResponse = prefixedDynamoDbClient.waitUntilTableExists(dataset).join()
+      dynamoDbClient.createTable(request).join()
+      val waiterResponse = dynamoDbClient.waitUntilTableExists(dataset).join()
       if (waiterResponse.matched.exception().isPresent)
         throw waiterResponse.matched.exception().get()
 
@@ -139,7 +208,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
           .tableName(dataset)
           .timeToLiveSpecification(ttlSpec)
           .build
-        prefixedDynamoDbClient.updateTimeToLive(ttlRequest).join()
+        dynamoDbClient.updateTimeToLive(ttlRequest).join()
         logger.info(s"TTL enabled on table: $dataset with attribute 'ttl'")
       }
 
@@ -171,10 +240,10 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
   protected def doGetLookups(getLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
     val getItemCompletables = getLookups.map { req =>
       val keyAttributeMap = primaryKeyMap(req.keyBytes)
-      val tableName = resolveTableName(req.dataset)
-      val getItemReq = GetItemRequest.builder.key(keyAttributeMap.toJava).tableName(tableName).build
+      val tableInfo = resolveBatchTableInfo(req.dataset)
+      val getItemReq = GetItemRequest.builder.key(keyAttributeMap.toJava).tableName(tableInfo.physicalTableName).build
       val startTs = System.currentTimeMillis()
-      (req, prefixedDynamoDbClient.getItem(getItemReq), startTs)
+      (req, dynamoDbClient.getItem(getItemReq), startTs)
     }
 
     // timestamp to use for all get responses when the underlying tables don't have a ts field
@@ -200,7 +269,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     val queryRequest = buildTimeRangeQuery(dataset, partitionKeyBytes, startTs, endTs)
     val callStartTs = System.currentTimeMillis()
     handleDynamoDbOperation(metricsContext.withSuffix("query"), dataset, callStartTs)(
-      prefixedDynamoDbClient.query(queryRequest)
+      dynamoDbClient.query(queryRequest)
     )
   }
 
@@ -208,7 +277,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     val queryRequest = buildPartitionOnlyQuery(dataset, partitionKeyBytes)
     val callStartTs = System.currentTimeMillis()
     handleDynamoDbOperation(metricsContext.withSuffix("query"), dataset, callStartTs)(
-      prefixedDynamoDbClient.query(queryRequest)
+      dynamoDbClient.query(queryRequest)
     )
   }
 
@@ -216,7 +285,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     val defaultTimestamp = Instant.now().toEpochMilli
 
     queryLookups.map { req =>
-      val resolvedDataset = resolveTableName(req.dataset)
+      val tableInfo = resolveBatchTableInfo(req.dataset)
       val tileComponents = extractTileKeyComponents(req.keyBytes)
       val endTs = req.endTsMillis.getOrElse(System.currentTimeMillis())
       val partitionKeys = generateTimeSeriesKeys(
@@ -228,7 +297,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
       // Optimize for the common case of a single partition key (queries within one day)
       if (partitionKeys.length == 1) {
-        queryPartition(resolvedDataset, partitionKeys.head, req.startTsMillis.get, req.endTsMillis)
+        queryPartition(tableInfo.physicalTableName, partitionKeys.head, req.startTsMillis.get, req.endTsMillis)
           .transform {
             case Success(response) =>
               val timedValues = extractTimedValues(response.items(), defaultTimestamp).getOrElse(Seq.empty)
@@ -239,7 +308,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       } else {
         // Multi-day query: fan out to multiple partition keys
         val queryFutures = partitionKeys.map { partitionKeyBytes =>
-          queryPartition(resolvedDataset, partitionKeyBytes, req.startTsMillis.get, req.endTsMillis)
+          queryPartition(tableInfo.physicalTableName, partitionKeyBytes, req.startTsMillis.get, req.endTsMillis)
         }
 
         Future.sequence(queryFutures).transform {
@@ -275,7 +344,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
     val startTs = System.currentTimeMillis()
     handleDynamoDbOperation(metricsContext.withSuffix("list"), request.dataset, startTs)(
-      prefixedDynamoDbClient.scan(scanRequest)
+      dynamoDbClient.scan(scanRequest)
     ).map { scanResponse =>
       val resultElements = extractListValues(scanResponse)
       val noPagesLeftResponse = ListResponse(request, resultElements, Map.empty)
@@ -323,7 +392,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         PutItemRequest.builder.tableName(req.dataset).item((attributeMap ++ tsMap ++ ttlMap).toJava).build()
       val startTs = System.currentTimeMillis()
       handleDynamoDbOperation(metricsContext.withSuffix("multiput"), req.dataset, startTs)(
-        prefixedDynamoDbClient.putItem(putItemReq)
+        dynamoDbClient.putItem(putItemReq)
       ).transform {
         case Success(_) => Success(true)
         case Failure(_) => Success(false)
@@ -382,7 +451,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
     try {
       val startTs = System.currentTimeMillis()
-      val importResponse = prefixedDynamoDbClient.importTable(importRequest).join()
+      val importResponse = dynamoDbClient.importTable(importRequest).join()
       val importArn = importResponse.importTableDescription().importArn()
 
       logger.info(s"DynamoDB import initiated with ARN: $importArn for table: $physicalTableName")
@@ -396,7 +465,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
           .tableName(physicalTableName)
           .timeToLiveSpecification(ttlSpec)
           .build
-        prefixedDynamoDbClient.updateTimeToLive(ttlRequest).join()
+        dynamoDbClient.updateTimeToLive(ttlRequest).join()
         logger.info(s"TTL enabled on imported table: $physicalTableName")
       }
 
@@ -405,11 +474,12 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       // Register the physical table name in the batch table registry
       create(batchTableRegistry)
       val registryKey = logicalTableName.sanitize.toUpperCase + batchSuffix
+      val registryValue = batchTableRegistryValue(physicalTableName)
       Await.result(
-        multiPut(Seq(KVStore.PutRequest(registryKey.getBytes, physicalTableName.getBytes, batchTableRegistry))),
+        multiPut(Seq(KVStore.PutRequest(registryKey.getBytes, registryValue.getBytes, batchTableRegistry))),
         30.seconds
       )
-      logger.info(s"Registry updated: $registryKey -> $physicalTableName")
+      logger.info(s"Registry updated: $registryKey -> $registryValue")
 
       gcOldBatchTables(logicalTableName)
 
@@ -447,7 +517,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       while (hasMore) {
         val reqBuilder = ListTablesRequest.builder.limit(100)
         exclusiveStart.foreach(reqBuilder.exclusiveStartTableName)
-        val resp = prefixedDynamoDbClient.listTables(reqBuilder.build()).join()
+        val resp = dynamoDbClient.listTables(reqBuilder.build()).join()
         val page = resp.tableNames().toScala
         val matching = page.takeWhile(_.startsWith(prefix))
         allMatchingTables ++= matching
@@ -483,7 +553,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
       toDelete.foreach { tableName =>
         try {
-          prefixedDynamoDbClient
+          dynamoDbClient
             .deleteTable(DeleteTableRequest.builder.tableName(tableName).build())
             .join()
           logger.info(s"Deleted old batch table: $tableName")
@@ -531,7 +601,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
           .importArn(importArn)
           .overrideConfiguration(DynamoDBKVStoreConstants.ControlPlaneApiOverride)
           .build()
-        val describeResponse = prefixedDynamoDbClient.describeImport(describeRequest).join()
+        val describeResponse = dynamoDbClient.describeImport(describeRequest).join()
         lastDescription = describeResponse.importTableDescription()
         status = lastDescription.importStatus()
 
@@ -666,7 +736,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         .replicaUpdates(replicaUpdates.toList.toJava)
         .overrideConfiguration(requestOverride)
         .build()
-      prefixedDynamoDbClient.updateTable(updateRequest).join()
+      dynamoDbClient.updateTable(updateRequest).join()
       logger.info(s"Global Table replicas added for '$tableName' in regions: ${replicaRegions.mkString(", ")}")
     } catch {
       case e: Exception =>
@@ -678,6 +748,27 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 object DynamoDBKVStoreConstants {
   val batchTableRegistry: String = "CHRONON_BATCH_TABLE_REGISTRY"
   val batchSuffix = "_BATCH"
+  val DaxTableDelimiter = "@"
+  val DaxEndpointPrefix = "dax://"
+  private val DaxRegistryValuePattern = s"^(${DaxEndpointPrefix}[^${DaxTableDelimiter}]+)${DaxTableDelimiter}(.+)$$".r
+
+  case class BatchTableInfo(physicalTableName: String, daxEndpoint: Option[String])
+
+  def registryValueForBatchTable(physicalTableName: String, daxEndpoint: Option[String] = None): String =
+    daxEndpoint
+      .filter(_.nonEmpty)
+      .map(endpoint => s"$endpoint$DaxTableDelimiter$physicalTableName")
+      .getOrElse(physicalTableName)
+
+  def batchTableInfoFromRegistryValue(value: String): BatchTableInfo = {
+    val trimmed = Option(value).map(_.trim).getOrElse("")
+    trimmed match {
+      case DaxRegistryValuePattern(endpoint, physicalTableName) =>
+        BatchTableInfo(physicalTableName, Some(endpoint))
+      case _ =>
+        BatchTableInfo(trimmed, daxEndpoint = None)
+    }
+  }
 
   // Optional field that indicates if this table is meant to be time sorted in Dynamo or not
   val isTimedSorted = "is-time-sorted"
