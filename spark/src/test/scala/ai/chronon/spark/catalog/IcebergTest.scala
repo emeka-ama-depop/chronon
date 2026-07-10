@@ -1,6 +1,6 @@
 package ai.chronon.spark.catalog
 
-import ai.chronon.api.PartitionSpec
+import ai.chronon.api.{PartitionRange, PartitionSpec}
 import ai.chronon.spark.utils.SparkTestBase
 import org.scalatest.matchers.should.Matchers
 
@@ -80,6 +80,203 @@ class IcebergTest extends SparkTestBase with Matchers {
 
     val parts = Iceberg.primaryPartitions(tableName, "ds", "")
     parts should contain theSameElementsAs List("2024-02-01", "2024-02-02", "2024-02-03")
+  }
+
+  it should "resolve primary partitions from Iceberg metadata" in {
+    val tableName = "default.iceberg_driver_metadata_partitions_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds STRING
+        ) USING iceberg
+        PARTITIONED BY (ds)
+      """)
+
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, '2024-02-01'),
+        (2, '2024-02-02')
+      """)
+
+      val table = Iceberg.loadIcebergTable(tableName).get
+      val oneDay = PartitionRange("2024-02-02", "2024-02-02")(PartitionSpec.daily)
+
+      Iceberg.listPartitions(table, "ds", "").get should contain theSameElementsAs
+        List("2024-02-01", "2024-02-02")
+      Iceberg.listPartitions(table, "ds", "ds >= '2024-02-02' AND ds <= '2024-02-02'").get shouldBe
+        List("2024-02-02")
+      Iceberg.listPartitions(table, "ds", "(ds >= '2024-02-02') AND (ds <= '2024-02-02')").get shouldBe
+        List("2024-02-02")
+      Iceberg.listPartitions(table, "ds", "(ds >= '2024-02-02') AND (ds < '2024-02-03')").get shouldBe
+        List("2024-02-02")
+      TableUtils(spark).partitions(tableName, partitionRange = Some(oneDay)) shouldBe List("2024-02-02")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "ignore null metadata partitions when computing the data watermark" in {
+    val tableName = "default.iceberg_driver_null_metadata_watermark_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds STRING
+        ) USING iceberg
+        PARTITIONED BY (ds)
+      """)
+
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, NULL),
+        (2, '2024-02-02')
+      """)
+
+      TableUtils(spark).dataWatermark(tableName, Some(PartitionSpec.daily)) shouldBe
+        Some("2024-02-02" -> PartitionSpec.daily.partitionEndMillis("2024-02-02"))
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "drop null metadata partitions and preserve raw partition values" in {
+    val tableName = "default.iceberg_driver_raw_metadata_partitions_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds STRING
+        ) USING iceberg
+        PARTITIONED BY (ds)
+      """)
+
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, NULL),
+        (2, 'north/west = 1%'),
+        (3, 'plain')
+      """)
+
+      val table = Iceberg.loadIcebergTable(tableName).get
+      Iceberg.listPartitions(table, "ds", "").get should contain theSameElementsAs
+        List("north/west = 1%", "plain")
+      Iceberg.primaryPartitions(tableName, "ds", "") should contain theSameElementsAs
+        List("north/west = 1%", "plain")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "return Iceberg partition columns in declaration order" in {
+    val tableName = "default.iceberg_driver_partition_column_order_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds STRING,
+          hr STRING
+        ) USING iceberg
+        PARTITIONED BY (ds, hr)
+      """)
+
+      Iceberg.partitionColumnNames(tableName) shouldBe Seq("ds", "hr")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "resolve exact distinct partitions from Iceberg file stats" in {
+    val tableName = "default.iceberg_driver_file_stats_partitions_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds STRING
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full',
+          'write.metadata.metrics.column.ds' = 'full'
+        )
+      """)
+
+      spark.sql(s"INSERT INTO $tableName VALUES (1, '2024-02-01')")
+      spark.sql(s"INSERT INTO $tableName VALUES (2, '2024-02-02')")
+
+      val table = Iceberg.loadIcebergTable(tableName).get
+      val oneDay = PartitionRange("2024-02-02", "2024-02-02")(PartitionSpec.daily)
+
+      Iceberg.listPartitionsByStats(table, "ds", "").get should contain theSameElementsAs
+        List("2024-02-01", "2024-02-02")
+      Iceberg.listPartitionsByStats(table, "ds", "ds >= '2024-02-02' AND ds <= '2024-02-02'").get shouldBe
+        List("2024-02-02")
+      Iceberg.listPartitionsByStats(table, "ds", "(ds >= '2024-02-02') AND (ds <= '2024-02-02')").get shouldBe
+        List("2024-02-02")
+      Iceberg.listPartitionsByStats(table, "ds", "(ds >= '2024-02-02') AND (ds < '2024-02-03')").get shouldBe
+        List("2024-02-02")
+      TableUtils(spark).partitions(tableName, partitionRange = Some(oneDay)) shouldBe List("2024-02-02")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "apply sub-daily string partition filters to Iceberg metadata and file stats" in {
+    val partitionedTable = "default.iceberg_driver_subdaily_metadata_test"
+    val statsTable = "default.iceberg_driver_subdaily_stats_test"
+    spark.sql(s"DROP TABLE IF EXISTS $partitionedTable")
+    spark.sql(s"DROP TABLE IF EXISTS $statsTable")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $partitionedTable (
+          id INT,
+          ds STRING
+        ) USING iceberg
+        PARTITIONED BY (ds)
+      """)
+
+      spark.sql(s"""
+        INSERT INTO $partitionedTable VALUES
+        (1, '2024-02-01-00-00'),
+        (2, '2024-02-01-03-00'),
+        (3, '2024-02-01-06-00')
+      """)
+
+      val filter = "ds >= '2024-02-01-03-00' AND ds <= '2024-02-01-06-00'"
+      Iceberg.listPartitions(Iceberg.loadIcebergTable(partitionedTable).get, "ds", filter).get should contain theSameElementsAs
+        List("2024-02-01-03-00", "2024-02-01-06-00")
+
+      spark.sql(s"""
+        CREATE TABLE $statsTable (
+          id INT,
+          ds STRING
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full',
+          'write.metadata.metrics.column.ds' = 'full'
+        )
+      """)
+
+      spark.sql(s"INSERT INTO $statsTable VALUES (1, '2024-02-01-00-00')")
+      spark.sql(s"INSERT INTO $statsTable VALUES (2, '2024-02-01-03-00')")
+      spark.sql(s"INSERT INTO $statsTable VALUES (3, '2024-02-01-06-00')")
+
+      Iceberg.listPartitionsByStats(Iceberg.loadIcebergTable(statsTable).get, "ds", filter).get should contain theSameElementsAs
+        List("2024-02-01-03-00", "2024-02-01-06-00")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $partitionedTable")
+      spark.sql(s"DROP TABLE IF EXISTS $statsTable")
+    }
   }
 
   it should "throw NotImplementedError when subPartitionsFilter is non-empty" in {
@@ -191,6 +388,38 @@ class IcebergTest extends SparkTestBase with Matchers {
     }
   }
 
+  it should "keep an exact sub-daily Iceberg max timestamp in the prior readiness bucket" in {
+    val tableName = "default.iceberg_subdaily_exact_boundary_stats_test"
+    val threeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          created_at TIMESTAMP
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full',
+          'write.metadata.metrics.column.created_at' = 'full'
+        )
+      """)
+      spark.sql(s"ALTER TABLE $tableName WRITE ORDERED BY created_at")
+
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, TIMESTAMP '2024-04-03 03:17:00'),
+        (2, TIMESTAMP '2024-04-03 06:00:00')
+      """)
+
+      Iceberg.statsDateRange(tableName, "created_at", threeHourSpec) shouldBe
+        Some(StatsDateRange(start = "2024-04-03-03-00", end = "2024-04-03-03-00"))
+      Iceberg.lastAvailablePartition(tableName, "created_at", threeHourSpec) shouldBe Some("2024-04-03-03-00")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
   it should "return the inclusive last partition from Iceberg file stats for a single-day timestamp range" in {
     val range = StatsDateRange(start = "2024-04-01", end = "2024-04-01")
 
@@ -232,7 +461,7 @@ class IcebergTest extends SparkTestBase with Matchers {
     }
   }
 
-  it should "fall back to scanning when Iceberg file stats do not cover the timestamp column" in {
+  it should "keep the readiness lookup on file stats when timestamp metrics are disabled" in {
     val tableName = "default.iceberg_time_missing_stats_test"
     spark.sql(s"DROP TABLE IF EXISTS $tableName")
 

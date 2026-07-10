@@ -2,6 +2,7 @@ package ai.chronon.spark.batch.iceberg
 
 import ai.chronon.api.{PartitionRange, PartitionSpec}
 import ai.chronon.observability.TileSummary
+import ai.chronon.spark.catalog.Iceberg
 import org.apache.iceberg.types.Types
 import org.apache.spark.sql.SparkSession
 import org.scalatest.flatspec.AnyFlatSpec
@@ -39,12 +40,11 @@ class IcebergPartitionStatsExtractorTest
       .table()
 
   private def plannedFileCount(table: org.apache.iceberg.Table, range: Option[PartitionRange]): Int = {
-    val tasks = IcebergPartitionStatsExtractor.scanFiles(table, range)
-    try {
-      tasks.iterator().asScala.size
-    } finally {
-      tasks.close()
-    }
+    Iceberg
+      .currentDataFiles(table,
+                        includeColumnStats = true,
+                        filter = IcebergPartitionStatsExtractor.rangeFilterExpression(table.schema(), range))(_.size)
+      .getOrElse(0)
   }
 
   override def beforeAll(): Unit = {
@@ -1000,53 +1000,46 @@ class IcebergPartitionStatsExtractorTest
     exception.getMessage should include("Partition column 'ds' not found")
   }
 
-  "IcebergPartitionStatsExtractor convertBoundValue" should "handle different data types" in {
-    val extractor = new IcebergPartitionStatsExtractor(spark)
-
+  "Iceberg.boundValue" should "handle different data types" in {
     // Test integer type - use little endian as Iceberg expects
     val intBytes = ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(42).flip()
     val intType = Types.IntegerType.get()
-    val intResult = extractor.convertBoundValue(intBytes, intType)
+    val intResult = Iceberg.boundValue(intBytes, intType)
     intResult should be(42)
 
     // Test long type - use little endian as Iceberg expects
     val longBytes = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(123456789L).flip()
     val longType = Types.LongType.get()
-    val longResult = extractor.convertBoundValue(longBytes, longType)
+    val longResult = Iceberg.boundValue(longBytes, longType)
     longResult should be(123456789L)
 
     // Test string type
     val stringBytes = ByteBuffer.wrap("test_string".getBytes("UTF-8")).order(java.nio.ByteOrder.LITTLE_ENDIAN)
     val stringType = Types.StringType.get()
-    val stringResult = extractor.convertBoundValue(stringBytes, stringType)
+    val stringResult = Iceberg.boundValue(stringBytes, stringType)
     stringResult.toString should be("test_string")
   }
 
   it should "handle null inputs gracefully" in {
-    val extractor = new IcebergPartitionStatsExtractor(spark)
-
     val exception = intercept[IllegalArgumentException] {
-      extractor.convertBoundValue(null, Types.IntegerType.get())
+      Iceberg.boundValue(null, Types.IntegerType.get())
     }
     exception.getMessage should include("bound cannot be null")
 
     val buffer = ByteBuffer.allocate(4).putInt(42).flip()
     val exception2 = intercept[IllegalArgumentException] {
-      extractor.convertBoundValue(buffer, null)
+      Iceberg.boundValue(buffer, null)
     }
     exception2.getMessage should include("fieldType cannot be null")
   }
 
   it should "throw exception on invalid bytebuffer" in {
-    val extractor = new IcebergPartitionStatsExtractor(spark)
-
     // Create an invalid byte buffer for the type
     val invalidBytes = ByteBuffer.allocate(1).put(1.toByte).flip() // Too small for int
     val intType = Types.IntegerType.get()
 
-    // Should fall back to toString when conversion fails
     assertThrows[java.nio.BufferUnderflowException] {
-      extractor.convertBoundValue(invalidBytes, intType)
+      Iceberg.boundValue(invalidBytes, intType)
     }
   }
 

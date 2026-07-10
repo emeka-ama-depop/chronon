@@ -250,7 +250,35 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
     }
   }
 
-  it should "fall back to scanning when Delta log stats do not cover the timestamp column" in {
+  it should "parse timestamp-shaped string stats when the partition format is daily" in {
+    val dbName = s"delta_string_timestamp_stats_${System.nanoTime()}"
+    val tableName = s"$dbName.string_timestamp_with_stats"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          created_at STRING,
+          user_id STRING
+        ) USING DELTA
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+          ('2024-01-01 12:00:00', 'user1'),
+          ('2024-01-03 12:00:00', 'user2')
+      """)
+
+      DeltaLake.statsDateRange(tableName, "created_at", PartitionSpec.daily) shouldBe
+        Some(StatsDateRange(start = "2024-01-01", end = "2024-01-03"))
+      DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-03")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
+  it should "keep the readiness lookup on file stats when the timestamp column is not indexed" in {
     val dbName = s"delta_stats_fallback_${System.nanoTime()}"
     val tableName = s"$dbName.time_missing_stats"
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")

@@ -190,9 +190,14 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
       .flatMap(_.maxTimestampDate(tableName, timestampColumn, effectiveSpec)(sparkSession))
   }
 
-  /** Returns the last listed partition and the time just after that partition ends.
-    * Most tables answer this from catalog metadata. Tables without catalog partitions may
-    * need one query over the partition column.
+  /** The table's last partition ds (in its own spec - no translation shim) and that partition's
+    * exclusive epoch upper bound. Readiness questions compare epoch millis - spec-free - rather
+    * than comparing ds values across specs.
+    *
+    * Cost contract: readiness checks stay metadata/file-stats fast when that information is
+    * available. Delta and Iceberg try active-file stats on the driver after partition metadata;
+    * if those stats are incomplete, the public format contract still falls back to the existing
+    * Spark data scan path. The millis arithmetic is local.
     */
   def dataWatermark(tableName: String, tableSpec: Option[PartitionSpec] = None): Option[(String, Long)] = {
     val spec = tableSpec.getOrElse(partitionSpec)

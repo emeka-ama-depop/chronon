@@ -329,6 +329,26 @@ private[catalog] case class StatsDateRange(start: String, end: String) {
   def lastAvailablePartition: String = end
 }
 
+private[catalog] object StatsDateRange {
+  def fromFileStats(fileRanges: Iterator[Option[(Long, Long)]], partitionSpec: PartitionSpec): Option[StatsDateRange] =
+    fromFileStats(fileRanges, partitionSpec, partitionSpec.at)
+
+  def fromFileStats(fileRanges: Iterator[Option[(Long, Long)]],
+                    partitionSpec: PartitionSpec,
+                    endPartition: Long => String): Option[StatsDateRange] =
+    fileRanges
+      .foldLeft(Some(None): Option[Option[(Long, Long)]]) {
+        case (None, _) | (_, None)         => None
+        case (Some(None), Some(fileRange)) => Some(Some(fileRange))
+        case (Some(Some((minMillis, maxMillis))), Some((lowerMillis, upperMillis))) =>
+          Some(Some(Math.min(minMillis, lowerMillis) -> Math.max(maxMillis, upperMillis)))
+      }
+      .flatten
+      .map { case (startMillis, endMillis) =>
+        StatsDateRange(partitionSpec.at(startMillis), endPartition(endMillis))
+      }
+}
+
 case class ResolvedTableName(catalog: String, namespace: String, table: String) {
   def toIdentifier: Identifier = Identifier.of(Array(namespace), table)
 

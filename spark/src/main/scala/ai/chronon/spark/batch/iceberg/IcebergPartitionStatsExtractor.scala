@@ -4,13 +4,13 @@ import ai.chronon.api.ScalaJavaConversions.JMapOps
 import ai.chronon.api.{PartitionRange, PartitionSpec, ThriftJsonCodec}
 import ai.chronon.observability._
 import ai.chronon.online.KVStore.PutRequest
-import ai.chronon.spark.catalog.Format
+import ai.chronon.spark.catalog.{Format, Iceberg}
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import org.apache.iceberg.DataFile
 import org.apache.iceberg.expressions.{Expression, Expressions}
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.iceberg.types.Type
-import org.apache.iceberg.{DataFile, FileScanTask}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.TableCatalog
 
@@ -19,7 +19,7 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 object IcebergPartitionStatsExtractor {
-  type PartitionKey = List[(String, String)]
+  type PartitionKey = Iceberg.PartitionKey
 
   case class IcebergPartitionStatsResult(
       tileSummaries: Map[TileSummaryKey, TileSummary],
@@ -41,16 +41,6 @@ object IcebergPartitionStatsExtractor {
         partitionMillis >= startMillis && partitionMillis < endExclusiveMillis
       }
     }
-
-  private[iceberg] def scanFiles(table: org.apache.iceberg.Table, range: Option[PartitionRange])(implicit
-      partitionSpec: PartitionSpec): org.apache.iceberg.io.CloseableIterable[FileScanTask] = {
-    val scan = rangeFilterExpression(table.schema(), range)
-      .map(table.newScan().filter)
-      .getOrElse(table.newScan())
-      .includeColumnStats()
-
-    scan.planFiles()
-  }
 
   private[iceberg] def rangeFilterExpression(schema: org.apache.iceberg.Schema, range: Option[PartitionRange])(implicit
       partitionSpec: PartitionSpec): Option[Expression] =
@@ -94,18 +84,12 @@ object IcebergPartitionStatsExtractor {
     }
 
   def extractPartitionMillisFromSlice(slice: String, partitionSpec: PartitionSpec): Long = {
-    // Parse hive-style partition string (e.g., "day=2024-01-15/hour=00") to extract partition value
-    val partitionPairs = slice
-      .split("/")
-      .map { pair =>
-        val parts = pair.split("=", 2)
-        if (parts.length == 2) {
-          parts(0).trim -> parts(1).trim
-        } else {
-          throw new IllegalArgumentException(s"Invalid partition format in slice: $pair")
-        }
+    val partitionPairs =
+      try {
+        Iceberg.parsePartitionPath(slice).toMap
+      } catch {
+        case e: IllegalStateException => throw new IllegalArgumentException(e.getMessage, e)
       }
-      .toMap
 
     // Extract the value for the partition column used by PartitionSpec
     val partitionValue = partitionPairs.getOrElse(
@@ -253,7 +237,12 @@ class PartitionAccumulator(
 }
 
 class IcebergPartitionStatsExtractor(spark: SparkSession) {
-  import IcebergPartitionStatsExtractor.{IcebergPartitionStatsResult, PartitionKey}
+  import IcebergPartitionStatsExtractor.{
+    IcebergPartitionStatsResult,
+    PartitionKey,
+    partitionKeyInRange,
+    rangeFilterExpression
+  }
 
   private def loadIcebergTable(fullTableName: String): Option[org.apache.iceberg.Table] = {
     try {
@@ -306,19 +295,16 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
                                          range: Option[PartitionRange])(implicit
       partitionSpec: PartitionSpec): mutable.Map[PartitionKey, PartitionAccumulator] = {
     val partitionAccumulators = mutable.Map[PartitionKey, PartitionAccumulator]()
-    val currentSnapshot = Option(table.currentSnapshot())
 
-    currentSnapshot.foreach { _ =>
-      val tasks = IcebergPartitionStatsExtractor.scanFiles(table, range)
-      try {
-        val iterator = tasks.iterator().asScala
-        while (iterator.hasNext) {
-          val file: DataFile = iterator.next().file()
+    Iceberg.currentDataFiles(table, includeColumnStats = true, filter = rangeFilterExpression(table.schema(), range)) {
+      files =>
+        val schema = Option(table.schema())
+          .getOrElse(throw new IllegalStateException("Table schema is null"))
+        val specs = Option(table.specs())
+          .getOrElse(throw new IllegalStateException("Table specs is null"))
+
+        files.foreach { file =>
           val rowCount: Long = file.recordCount()
-          val schema = Option(table.schema())
-            .getOrElse(throw new IllegalStateException("Table schema is null"))
-          val specs = Option(table.specs())
-            .getOrElse(throw new IllegalStateException("Table specs is null"))
           val icebergPartitionSpec: org.apache.iceberg.PartitionSpec = Option(specs.get(file.specId()))
             .getOrElse(throw new IllegalStateException(s"Partition spec not found for specId: ${file.specId()}"))
           val partitionFieldIds = Option(icebergPartitionSpec.fields())
@@ -330,19 +316,9 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
             .getOrElse(throw new IllegalStateException("File partition data is null"))
           val partitionPath = icebergPartitionSpec.partitionToPath(partition)
 
-          val partitionColToValue: PartitionKey = partitionPath
-            .split("/")
-            .map { pair =>
-              val parts = pair.split("=", 2)
-              if (parts.length == 2) {
-                parts(0) -> parts(1)
-              } else {
-                throw new IllegalStateException(s"Invalid partition format: $pair in path $partitionPath")
-              }
-            }
-            .toList
+          val partitionColToValue: PartitionKey = Iceberg.parsePartitionPath(partitionPath)
 
-          if (IcebergPartitionStatsExtractor.partitionKeyInRange(partitionColToValue, range)) {
+          if (partitionKeyInRange(partitionColToValue, range)) {
             val columnStats = extractColumnStats(file, schema, partitionFieldIds)
             val accumulator = partitionAccumulators.getOrElseUpdate(
               partitionColToValue,
@@ -351,9 +327,6 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
             accumulator.addFileStats(rowCount, columnStats)
           }
         }
-      } finally {
-        tasks.close()
-      }
     }
 
     partitionAccumulators
@@ -392,7 +365,7 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
           .flatMap { case (fieldId, bound) =>
             Option(schema.findField(fieldId)).flatMap { field =>
               Option(bound).filter(_ != null).map { validBound =>
-                fieldId.toInt -> convertBoundValue(validBound, field.`type`())
+                fieldId.toInt -> Iceberg.boundValue(validBound, field.`type`())
               }
             }
           }
@@ -407,7 +380,7 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
           .flatMap { case (fieldId, bound) =>
             Option(schema.findField(fieldId)).flatMap { field =>
               Option(bound).filter(_ != null).map { validBound =>
-                fieldId.toInt -> convertBoundValue(validBound, field.`type`())
+                fieldId.toInt -> Iceberg.boundValue(validBound, field.`type`())
               }
             }
           }
@@ -435,11 +408,5 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
     }
 
     columnStatsMap.toMap
-  }
-
-  private[spark] def convertBoundValue(bound: java.nio.ByteBuffer, fieldType: org.apache.iceberg.types.Type): Any = {
-    require(bound != null, "bound cannot be null")
-    require(fieldType != null, "fieldType cannot be null")
-    org.apache.iceberg.types.Conversions.fromByteBuffer(fieldType, bound)
   }
 }
