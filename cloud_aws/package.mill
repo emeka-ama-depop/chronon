@@ -15,6 +15,8 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
   private val avroVersion = build.Constants.avroVersion
   private val jettyVersion = build.Constants.jettyVersion
   private val nimbusJoseJwtVersion = "9.37.4"
+  // amazon-dax-client 2.0.10 is compiled against this AWS SDK release. Keep the full SDK family aligned.
+  private val awsSdkVersion = "2.38.5"
 
   def moduleDeps = Seq(build.spark(crossValue), build.aggregator(crossValue), build.api(crossValue), build.online(crossValue), build.cloud_k8s(crossValue))
 
@@ -41,22 +43,22 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
   }
 
   def mvnDeps = build.Constants.commonDeps ++ build.Constants.loggingApiDeps ++ build.Constants.utilityDeps  ++ Seq(
-    mvn"software.amazon.awssdk:dynamodb:2.30.13",
-    mvn"software.amazon.awssdk:ec2:2.30.13",
-    mvn"software.amazon.awssdk:emr:2.30.13",
-    mvn"software.amazon.awssdk:emrserverless:2.30.13",
-    mvn"software.amazon.awssdk:s3:2.30.13",
-    mvn"software.amazon.awssdk:regions:2.30.13",
-    mvn"software.amazon.awssdk:aws-core:2.30.13",
-    mvn"software.amazon.awssdk:sdk-core:2.30.13",
-    mvn"software.amazon.awssdk:utils:2.30.13",
-    mvn"software.amazon.awssdk:auth:2.30.13",
-    mvn"software.amazon.awssdk:url-connection-client:2.30.13",
-    mvn"software.amazon.awssdk:netty-nio-client:2.30.13",
-    mvn"software.amazon.awssdk:sts:2.30.13",
+    mvn"software.amazon.awssdk:dynamodb:$awsSdkVersion",
+    mvn"software.amazon.awssdk:ec2:$awsSdkVersion",
+    mvn"software.amazon.awssdk:emr:$awsSdkVersion",
+    mvn"software.amazon.awssdk:emrserverless:$awsSdkVersion",
+    mvn"software.amazon.awssdk:s3:$awsSdkVersion",
+    mvn"software.amazon.awssdk:regions:$awsSdkVersion",
+    mvn"software.amazon.awssdk:aws-core:$awsSdkVersion",
+    mvn"software.amazon.awssdk:sdk-core:$awsSdkVersion",
+    mvn"software.amazon.awssdk:utils:$awsSdkVersion",
+    mvn"software.amazon.awssdk:auth:$awsSdkVersion",
+    mvn"software.amazon.awssdk:url-connection-client:$awsSdkVersion",
+    mvn"software.amazon.awssdk:netty-nio-client:$awsSdkVersion",
+    mvn"software.amazon.awssdk:sts:$awsSdkVersion",
     mvn"software.amazon.dax:amazon-dax-client:2.0.10",
-    mvn"software.amazon.awssdk:secretsmanager:2.30.13",
-    mvn"software.amazon.awssdk:identity-spi:2.30.13",
+    mvn"software.amazon.awssdk:secretsmanager:$awsSdkVersion",
+    mvn"software.amazon.awssdk:identity-spi:$awsSdkVersion",
     mvn"software.amazon.msk:aws-msk-iam-auth:2.3.5",
     mvn"org.apache.hadoop:hadoop-client-api:3.4.1",
     mvn"org.apache.iceberg::iceberg-spark-runtime-3.5:1.10.0",

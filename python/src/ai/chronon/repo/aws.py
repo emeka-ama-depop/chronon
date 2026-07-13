@@ -140,12 +140,10 @@ class AwsRunner(Runner):
             LOG.warning(f"Failed to read Flink API props from conf {conf_path}: {e}")
             return {}
 
-        metadata = payload.get("metaData", payload)
-        common_conf = (
-            metadata.get("executionInfo", {})
-            .get("conf", {})
-            .get("common", {})
-        )
+        metadata = payload.get("metaData", payload) or {}
+        execution_info = metadata.get("executionInfo") or {}
+        conf = execution_info.get("conf") or {}
+        common_conf = conf.get("common") or {}
         return {
             f"-Z{key}": _format_api_prop_value(value)
             for key, value in common_conf.items()

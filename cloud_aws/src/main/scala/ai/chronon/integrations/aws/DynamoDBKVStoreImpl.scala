@@ -19,37 +19,46 @@ import ai.chronon.online.KVStore._
 import ai.chronon.online.metrics.Metrics.Context
 import ai.chronon.online.metrics.{Metrics, TTLCache}
 import ai.chronon.spark.{IonPathConfig, IonWriter}
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
 import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration
 import software.amazon.awssdk.core.SdkBytes
-import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model._
-import software.amazon.dax.{ClusterDaxAsyncClient, Configuration}
 
 import java.nio.charset.Charset
 import java.time.{Duration, Instant, LocalDate}
 import java.time.format.{DateTimeFormatter, DateTimeParseException}
 import java.util
-import java.util.concurrent.{CompletableFuture, CompletionException}
+import java.util.concurrent.{CompletableFuture, CompletionException, TimeUnit}
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
 import scala.compat.java8.FutureConverters
 import scala.concurrent.duration._
-import scala.concurrent.{Await, Future}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
-class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[String, String] = Map.empty)
+class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient,
+                          conf: Map[String, String] = Map.empty,
+                          daxClientProvider: Option[String => DynamoDbAsyncClient])
     extends KVStore {
   import DynamoDBKVStoreConstants._
 
+  def this(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[String, String]) =
+    this(rawDynamoDbClient, conf, None)
+
+  def this(rawDynamoDbClient: DynamoDbAsyncClient) =
+    this(rawDynamoDbClient, Map.empty, None)
+
   protected val enableTtl: Boolean = conf.getOrElse(KvEnableTtlArg, "true").toBoolean
-  private val enableDax: Boolean = conf.getOrElse(KvEnableDaxArg, "false").toBoolean
+  private[aws] val enableDax: Boolean = conf.getOrElse(KvEnableDaxArg, "false").toBoolean
   private[aws] val configuredDaxEndpoint: Option[String] =
-    conf.get(KvDaxEndpointArg).filter(_.nonEmpty).filter(_ => enableDax)
+    conf
+      .get(KvDaxEndpointArg)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .filter(_ => enableDax)
+      .map(validateDaxEndpoint)
   private[aws] def daxEnabled: Boolean = configuredDaxEndpoint.nonEmpty
-  private val awsRegion: Option[String] =
-    AwsApiImpl.getOptional("AWS_DEFAULT_REGION", conf).orElse(AwsApiImpl.getOptional("AWS_REGION", conf))
 
   private val tablePrefix = conf.getOrElse(KvTablePrefixArg, "")
 
@@ -60,45 +69,23 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toList)
       .getOrElse(List.empty)
 
-  private val daxClients = TrieMap.empty[String, DynamoDbAsyncClient]
   private val cacheEndpointsByTable = TrieMap.empty[String, Option[String]]
+  private val physicalTableByDataset = TrieMap.empty[String, String]
+  private val batchGetRequestLimiter = new AsyncRequestLimiter(BatchGetMaxConcurrentRequests)
+  private lazy val daxClientForEndpoint = daxClientProvider.getOrElse(AwsApiImpl.cachedDaxClientProvider(conf))
 
   // Wrap the client to automatically prefix all table names. Data-plane calls can route to DAX;
   // metadata and control-plane calls stay on the raw DynamoDB client.
   private[aws] lazy val dynamoDbClient: PrefixedDynamoDbAsyncClient = {
     logger.info(
       s"Using: table prefix: '$tablePrefix' (prefix will be added to all table names used by this KVStore); enableTtl: $enableTtl; enableDax: $enableDax")
-    new PrefixedDynamoDbAsyncClient(rawDynamoDbClient, tablePrefix, dataDelegateForTableName = cacheEndpointForTable)
+    val dataDelegate = if (enableDax) cacheEndpointForTable _ else (_: String) => None
+    new PrefixedDynamoDbAsyncClient(rawDynamoDbClient, tablePrefix, dataDelegateForTableName = dataDelegate)
   }
-
-  private[aws] def daxClientForEndpoint(endpoint: String): DynamoDbAsyncClient =
-    daxClients.getOrElseUpdate(
-      endpoint, {
-        logger.info(s"Creating DynamoDB DAX client for endpoint: $endpoint")
-        ClusterDaxAsyncClient
-          .builder()
-          .overrideConfiguration(daxConfiguration(endpoint))
-          .build()
-      }
-    )
 
   if (enableDax && configuredDaxEndpoint.isEmpty) {
-    logger.warn(s"$KvEnableDaxArg is true, but $KvDaxEndpointArg is not configured; using DynamoDB")
-  }
-
-  private[aws] def daxConfiguration(endpoint: String,
-                                    credentialsProvider: Option[AwsCredentialsProvider] = None): Configuration = {
-    val builder = Configuration.builder().url(endpoint)
-    credentialsProvider.foreach(builder.credentialsProvider)
-    awsRegion.foreach { region =>
-      try {
-        builder.region(Region.of(region))
-      } catch {
-        case e: IllegalArgumentException =>
-          throw new IllegalArgumentException(s"Invalid AWS region format: $region", e)
-      }
-    }
-    builder.build()
+    logger.info(
+      s"$KvEnableDaxArg is true without a global $KvDaxEndpointArg; per-table registry endpoints will still be used")
   }
 
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("dynamodb")
@@ -113,18 +100,30 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         .build
 
       val item = dynamoDbClient.getItem(request).join().item().toScala
-      val tableInfo = item
+      val parsedTableInfo = item
         .get("valueBytes")
         .map(v => batchTableInfoFromRegistryValue(new String(v.b().asByteArray())))
         .getOrElse(BatchTableInfo(dataset, daxEndpoint = None))
-      recordCacheEndpoint(tableInfo)
+      val resolvedEndpoint =
+        if (enableDax) parsedTableInfo.daxEndpoint.orElse(configuredDaxEndpoint) else None
+      recordCacheEndpoint(dataset, parsedTableInfo.copy(daxEndpoint = resolvedEndpoint))
     },
     contextBuilder = { _ => metricsContext.withSuffix("batch_table_cache") }
   )
 
-  private[aws] def resolveBatchTableInfo(dataset: String): BatchTableInfo =
-    if (dataset.endsWith(batchSuffix)) batchTableCache.refresh(dataset)
-    else recordCacheEndpoint(BatchTableInfo(dataset, configuredDaxEndpoint.filterNot(_ => isMetadataDataset(dataset))))
+  private[aws] def resolveBatchTableInfo(dataset: String): BatchTableInfo = {
+    if (dataset.endsWith(batchSuffix)) {
+      batchTableCache.refresh(dataset)
+    } else {
+      val daxEndpoint =
+        if (!enableDax || isMetadataDataset(dataset)) None
+        else if (isStreamingTable(dataset)) {
+          val siblingBatchDataset = dataset.stripSuffix(streamingSuffix) + batchSuffix
+          batchTableCache.refresh(siblingBatchDataset).daxEndpoint.orElse(configuredDaxEndpoint)
+        } else configuredDaxEndpoint
+      recordCacheEndpoint(dataset, BatchTableInfo(dataset, daxEndpoint))
+    }
+  }
 
   private[aws] def resolveTableName(dataset: String): String =
     resolveBatchTableInfo(dataset).physicalTableName
@@ -138,14 +137,31 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
   private[aws] def isCacheEligible(dataset: String): Boolean =
     resolveBatchTableInfo(dataset).daxEndpoint.nonEmpty && !isMetadataDataset(dataset)
 
-  private def recordCacheEndpoint(tableInfo: BatchTableInfo): BatchTableInfo = {
-    cacheEndpointsByTable.put(tableInfo.physicalTableName, tableInfo.daxEndpoint)
+  private def recordCacheEndpoint(dataset: String, tableInfo: BatchTableInfo): BatchTableInfo = {
+    if (enableDax) {
+      physicalTableByDataset
+        .put(dataset, tableInfo.physicalTableName)
+        .filterNot(_ == tableInfo.physicalTableName)
+        .foreach(cacheEndpointsByTable.remove)
+      cacheEndpointsByTable.put(tableInfo.physicalTableName, tableInfo.daxEndpoint)
+    }
     tableInfo
   }
 
   private def cacheEndpointForTable(tableName: String): Option[DynamoDbAsyncClient] =
     if (isMetadataDataset(tableName)) None
-    else cacheEndpointsByTable.get(tableName).getOrElse(configuredDaxEndpoint).map(daxClientForEndpoint)
+    else {
+      // Streaming writers are long-lived. Resolve through the TTL-backed sibling registry on every write
+      // so an endpoint rotation cannot leave Flink writing through an old DAX cluster indefinitely.
+      val endpoint =
+        if (isStreamingTable(tableName)) resolveBatchTableInfo(tableName).daxEndpoint
+        else
+          cacheEndpointsByTable.get(tableName) match {
+            case Some(cachedEndpoint) => cachedEndpoint
+            case None                 => resolveBatchTableInfo(tableName).daxEndpoint
+          }
+      endpoint.map(daxClientForEndpoint)
+    }
 
   override def create(dataset: String): Unit = create(dataset, Map.empty)
 
@@ -281,45 +297,120 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     )
   }
 
-  protected def doQueryLookups(queryLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
-    val defaultTimestamp = Instant.now().toEpochMilli
+  protected def batchGetTimeRange(dataset: String,
+                                  baseKeyBytes: Array[Byte],
+                                  startTs: Long,
+                                  endTs: Long,
+                                  tileSizeMillis: Long): Future[Seq[TimedValue]] = {
+    val keyBatches = timeSeriesGetKeyIterator(baseKeyBytes, startTs, endTs, tileSizeMillis).grouped(BatchGetMaxKeys)
+    batchGetItems(dataset, keyBatches).map { items =>
+      extractTimedValues(items.toList.toJava, Instant.now().toEpochMilli).get.sortBy(_.millis)
+    }
+  }
 
+  private def batchGetItems(
+      dataset: String,
+      keyBatches: Iterator[Seq[Map[String, AttributeValue]]]): Future[Seq[util.Map[String, AttributeValue]]] = {
+    def nextWave(
+        accumulated: Vector[util.Map[String, AttributeValue]]): Future[Vector[util.Map[String, AttributeValue]]] = {
+      val wave = keyBatches.take(BatchGetMaxConcurrentRequests).toSeq
+      if (wave.isEmpty) Future.successful(accumulated)
+      else {
+        Future
+          .sequence(wave.map(batch => batchGetChunk(dataset, batch, attempt = 0)))
+          .flatMap(results => nextWave(accumulated ++ results.flatten))
+      }
+    }
+
+    nextWave(Vector.empty)
+  }
+
+  private def batchGetChunk(dataset: String,
+                            keys: Seq[Map[String, AttributeValue]],
+                            attempt: Int): Future[Seq[util.Map[String, AttributeValue]]] = {
+    val keysAndAttributes = KeysAndAttributes.builder().keys(keys.map(_.toJava).toList.toJava).build()
+    val request = BatchGetItemRequest.builder().requestItems(Map(dataset -> keysAndAttributes).toJava).build()
+
+    batchGetRequestLimiter
+      .withPermit {
+        val callStartTs = System.currentTimeMillis()
+        handleDynamoDbOperation(metricsContext.withSuffix("batch_get"), dataset, callStartTs)(
+          dynamoDbClient.batchGetItem(request)
+        )
+      }
+      .flatMap { response =>
+        val items = Option(response.responses())
+          .flatMap(responses => responses.toScala.get(dataset))
+          .map(_.toScala)
+          .getOrElse(Seq.empty)
+        val unprocessedKeys = Option(response.unprocessedKeys())
+          .flatMap(unprocessed => unprocessed.toScala.get(dataset))
+          .map(_.keys().toScala.map(_.toScala.toMap))
+          .getOrElse(Seq.empty)
+
+        if (unprocessedKeys.isEmpty) {
+          Future.successful(items)
+        } else if (attempt >= BatchGetMaxRetries) {
+          Future.failed(new RuntimeException(
+            s"DynamoDB BatchGetItem left ${unprocessedKeys.size} keys unprocessed for $dataset after $attempt retries"))
+        } else {
+          delayedFuture(BatchGetRetryBaseDelayMillis * (1L << attempt))
+            .flatMap(_ => batchGetChunk(dataset, unprocessedKeys, attempt + 1))
+            .map(items ++ _)
+        }
+      }
+  }
+
+  private def delayedFuture(delayMillis: Long): Future[Unit] = {
+    val result = new CompletableFuture[Unit]()
+    CompletableFuture
+      .delayedExecutor(delayMillis, TimeUnit.MILLISECONDS)
+      .execute(new Runnable {
+        override def run(): Unit = result.complete(())
+      })
+    FutureConverters.toScala(result)
+  }
+
+  private def queryTimeRange(dataset: String,
+                             partitionKeys: Seq[Array[Byte]],
+                             startTs: Long,
+                             endTs: Long): Future[Seq[TimedValue]] = {
+    val defaultTimestamp = Instant.now().toEpochMilli
+    Future
+      .sequence(partitionKeys.map(partitionKey => queryPartition(dataset, partitionKey, startTs, Some(endTs))))
+      .map { responses =>
+        responses
+          .flatMap(response => extractTimedValues(response.items(), defaultTimestamp).getOrElse(Seq.empty))
+          .sortBy(_.millis)
+      }
+  }
+
+  protected def doQueryLookups(queryLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
     queryLookups.map { req =>
       val tableInfo = resolveBatchTableInfo(req.dataset)
       val tileComponents = extractTileKeyComponents(req.keyBytes)
       val endTs = req.endTsMillis.getOrElse(System.currentTimeMillis())
-      val partitionKeys = generateTimeSeriesKeys(
-        tileComponents.baseKeyBytes,
-        req.startTsMillis.get,
-        endTs,
-        tileComponents.tileSizeMillis
-      )
 
-      // Optimize for the common case of a single partition key (queries within one day)
-      if (partitionKeys.length == 1) {
-        queryPartition(tableInfo.physicalTableName, partitionKeys.head, req.startTsMillis.get, req.endTsMillis)
-          .transform {
-            case Success(response) =>
-              val timedValues = extractTimedValues(response.items(), defaultTimestamp).getOrElse(Seq.empty)
-              Success(GetResponse(req, Success(timedValues)))
-            case Failure(e) =>
-              Success(GetResponse(req, Failure(e)))
-          }
-      } else {
-        // Multi-day query: fan out to multiple partition keys
-        val queryFutures = partitionKeys.map { partitionKeyBytes =>
-          queryPartition(tableInfo.physicalTableName, partitionKeyBytes, req.startTsMillis.get, req.endTsMillis)
+      val timedValues =
+        if (tableInfo.daxEndpoint.nonEmpty && isStreamingTable(req.dataset) && tileComponents.tileSizeMillis > 0) {
+          batchGetTimeRange(tableInfo.physicalTableName,
+                            tileComponents.baseKeyBytes,
+                            req.startTsMillis.get,
+                            endTs,
+                            tileComponents.tileSizeMillis)
+        } else {
+          val partitionKeys = generateTimeSeriesKeys(
+            tileComponents.baseKeyBytes,
+            req.startTsMillis.get,
+            endTs,
+            tileComponents.tileSizeMillis
+          )
+          queryTimeRange(tableInfo.physicalTableName, partitionKeys, req.startTsMillis.get, endTs)
         }
 
-        Future.sequence(queryFutures).transform {
-          case Success(responses) =>
-            val allTimedValues = responses.flatMap { response =>
-              extractTimedValues(response.items(), defaultTimestamp).getOrElse(Seq.empty)
-            }
-            Success(GetResponse(req, Success(allTimedValues)))
-          case Failure(e) =>
-            Success(GetResponse(req, Failure(e)))
-        }
+      timedValues.transform {
+        case Success(values) => Success(GetResponse(req, Success(values)))
+        case Failure(e)      => Success(GetResponse(req, Failure(e)))
       }
     }
   }
@@ -556,6 +647,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
           dynamoDbClient
             .deleteTable(DeleteTableRequest.builder.tableName(tableName).build())
             .join()
+          cacheEndpointsByTable.remove(tableName)
           logger.info(s"Deleted old batch table: $tableName")
         } catch {
           case e: Exception =>
@@ -748,11 +840,61 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 object DynamoDBKVStoreConstants {
   val batchTableRegistry: String = "CHRONON_BATCH_TABLE_REGISTRY"
   val batchSuffix = "_BATCH"
+  val streamingSuffix = "_STREAMING"
   val DaxTableDelimiter = "@"
   val DaxEndpointPrefix = "dax://"
   private val DaxRegistryValuePattern = s"^(${DaxEndpointPrefix}[^${DaxTableDelimiter}]+)${DaxTableDelimiter}(.+)$$".r
 
   case class BatchTableInfo(physicalTableName: String, daxEndpoint: Option[String])
+
+  private[aws] final class AsyncRequestLimiter(maxPermits: Int) {
+    require(maxPermits > 0, s"maxPermits must be positive, found $maxPermits")
+
+    private var availablePermits = maxPermits
+    private val waiters = mutable.Queue.empty[Promise[Unit]]
+
+    private def acquire(): Future[Unit] = synchronized {
+      if (availablePermits > 0) {
+        availablePermits -= 1
+        Future.successful(())
+      } else {
+        val waiter = Promise[Unit]()
+        waiters.enqueue(waiter)
+        waiter.future
+      }
+    }
+
+    private def release(): Unit = {
+      val nextWaiter = synchronized {
+        if (waiters.nonEmpty) Some(waiters.dequeue())
+        else {
+          availablePermits += 1
+          None
+        }
+      }
+      nextWaiter.foreach(_.success(()))
+    }
+
+    def withPermit[T](operation: => Future[T])(implicit executionContext: ExecutionContext): Future[T] =
+      acquire().flatMap { _ =>
+        try operation.andThen { case _ => release() }
+        catch {
+          case NonFatal(exception) =>
+            release()
+            Future.failed(exception)
+        }
+      }
+  }
+
+  def validateDaxEndpoint(endpoint: String): String = {
+    require(
+      endpoint.startsWith(DaxEndpointPrefix) && endpoint.length > DaxEndpointPrefix.length,
+      s"DAX endpoint must start with '$DaxEndpointPrefix' and include a host"
+    )
+    require(!endpoint.contains(DaxTableDelimiter),
+            s"DAX endpoint must not contain the registry delimiter '$DaxTableDelimiter'")
+    endpoint
+  }
 
   def registryValueForBatchTable(physicalTableName: String, daxEndpoint: Option[String] = None): String =
     daxEndpoint
@@ -780,7 +922,7 @@ object DynamoDBKVStoreConstants {
   val sortKeyColumn = Constants.TimeColumn
 
   // Streaming tables use TileKey wrapping for tiled data.
-  def isStreamingTable(dataset: String): Boolean = dataset.endsWith("_STREAMING")
+  def isStreamingTable(dataset: String): Boolean = dataset.endsWith(streamingSuffix)
 
   // Control plane operations (ImportTable, DeleteTable, DescribeImport) are slower than
   // data plane operations (GetItem, PutItem). Use higher timeouts to avoid intermittent failures.
@@ -815,6 +957,10 @@ object DynamoDBKVStoreConstants {
 
   val BatchTableGCAgeDays = 30
   val BatchTableGCMaxDelete = 10
+  val BatchGetMaxKeys = 100
+  val BatchGetMaxConcurrentRequests = 4
+  val BatchGetMaxRetries = 3
+  val BatchGetRetryBaseDelayMillis = 10L
   // Batch table names embed the date with '_' separators (e.g. 2026_04_16) since '-' is not valid in DynamoDB table names
   val BatchTableDateFormatter: DateTimeFormatter =
     DateTimeFormatter.ofPattern(PartitionSpec.daily.format.replace("-", "_"))
@@ -843,6 +989,48 @@ object DynamoDBKVStoreConstants {
   def primaryKeyMap(keyBytes: Array[Byte]): Map[String, AttributeValue] = {
     Map(partitionKeyColumn -> AttributeValue.builder.b(SdkBytes.fromByteArray(keyBytes)).build)
   }
+
+  private[aws] def timeSeriesGetKeyIterator(baseKeyBytes: Array[Byte],
+                                            startTs: Long,
+                                            endTs: Long,
+                                            tileSizeMillis: Long): Iterator[Map[String, AttributeValue]] = {
+    require(tileSizeMillis > 0, s"Tile size must be positive, found $tileSizeMillis")
+    if (endTs < startTs) return Iterator.empty
+
+    val remainder = Math.floorMod(startTs, tileSizeMillis)
+    val offsetToFirstTile = if (remainder == 0) 0L else tileSizeMillis - remainder
+    if (offsetToFirstTile > 0 && startTs > Long.MaxValue - offsetToFirstTile) return Iterator.empty
+
+    val firstTileTimestamp = startTs + offsetToFirstTile
+    new Iterator[Map[String, AttributeValue]] {
+      private var nextTileTimestamp = firstTileTimestamp
+      private var hasMore = firstTileTimestamp <= endTs
+
+      override def hasNext: Boolean = hasMore
+
+      override def next(): Map[String, AttributeValue] = {
+        if (!hasMore) throw new NoSuchElementException("next on empty time-series key iterator")
+
+        val tileTimestamp = nextTileTimestamp
+        if (tileTimestamp > Long.MaxValue - tileSizeMillis) {
+          hasMore = false
+        } else {
+          nextTileTimestamp = tileTimestamp + tileSizeMillis
+          hasMore = nextTileTimestamp <= endTs
+        }
+
+        primaryKeyMap(buildKeyWithTileSize(baseKeyBytes, tileTimestamp, tileSizeMillis)) +
+          (sortKeyColumn -> AttributeValue.builder.n(tileTimestamp.toString).build)
+      }
+    }
+  }
+
+  /** Builds exact composite keys for all aligned tiles covered by DynamoDB Query's inclusive time bounds. */
+  def buildTimeSeriesGetKeys(baseKeyBytes: Array[Byte],
+                             startTs: Long,
+                             endTs: Long,
+                             tileSizeMillis: Long): Seq[Map[String, AttributeValue]] =
+    timeSeriesGetKeyIterator(baseKeyBytes, startTs, endTs, tileSizeMillis).toSeq
 
   def buildAttributeMap(keyBytes: Array[Byte], valueBytes: Array[Byte]): Map[String, AttributeValue] = {
     primaryKeyMap(keyBytes) ++

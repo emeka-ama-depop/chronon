@@ -15,8 +15,16 @@ import scala.util.{Failure, Success}
   *   - Keys are plain Avro-encoded bytes, not TileKey-wrapped Thrift — so doQueryLookups
   *     must skip TileKey deserialization and query by raw partition key + sort key range directly.
   */
-class DynamoDBStatsKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[String, String] = Map.empty)
-    extends DynamoDBKVStoreImpl(rawDynamoDbClient, conf) {
+class DynamoDBStatsKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient,
+                               conf: Map[String, String] = Map.empty,
+                               daxClientProvider: Option[String => DynamoDbAsyncClient])
+    extends DynamoDBKVStoreImpl(rawDynamoDbClient, conf, daxClientProvider) {
+
+  def this(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[String, String]) =
+    this(rawDynamoDbClient, conf, None)
+
+  def this(rawDynamoDbClient: DynamoDbAsyncClient) =
+    this(rawDynamoDbClient, Map.empty, None)
 
   override protected val enableTtl: Boolean = false
 

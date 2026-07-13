@@ -136,9 +136,23 @@ The AWS DynamoDB KV implementation accepts these optional KV args through the AP
 | Key | Default | Description |
 |-----|---------|-------------|
 | `kv.enableTtl` | `true` | Enables DynamoDB TTL on created and imported tables. |
-| `kv.enableDax` | `false` | Enables DAX for DynamoDB data-plane reads and writes when `kv.daxEndpoint` is also configured. |
-| `kv.daxEndpoint` | empty | DAX cluster endpoint such as `dax://my-cluster.example.com`. When `kv.enableDax=true` and this endpoint is configured, Chronon uses a DAX-backed DynamoDB client for `GetItem`, `Query`, and `PutItem` calls. Registry reads, table creation, and imports still use DynamoDB. |
+| `kv.enableDax` | `false` | Enables DAX item-cache reads and write-through streaming writes when an endpoint is configured or resolved from the batch-table registry. |
+| `kv.daxEndpoint` | empty | DAX cluster endpoint such as `dax://my-cluster.example.com`. With DAX enabled, point lookups use DAX `GetItem`, timed streaming lookups use DAX `BatchGetItem` instead of `Query`, and `PutItem` writes use DAX's write-through path. `Query`, registry reads, table creation, and imports go directly to DynamoDB. |
 | `kv.tablePrefix` | empty | Prefixes DynamoDB table names used by this KV store. |
 | `kv.replicaRegions` | empty | Comma-separated replica regions to add to created/imported tables as best effort global-table replicas. |
 
 For AWS Flink streaming jobs launched through the AWS runner, `kv.*` keys from the compiled `executionInfo.conf.common` are forwarded as `-Z...` API properties. Explicit `CHRONON_ONLINE_ARGS` are appended after those generated properties, so command-line values can still override team config.
+
+Zipline orchestration does not use the Python submitter path. Configure these properties in `teams.py` through the team's `env.common` `CHRONON_ONLINE_ARGS` instead:
+
+```python
+foo = Team(
+    env=EnvironmentVariables(
+        common={
+            "CHRONON_ONLINE_ARGS": "-Zkv.enableDax=true -Zkv.daxEndpoint=dax://my-cluster.example.com",
+        }
+    )
+)
+```
+
+For streaming tables, deploy the Flink writer with DAX enabled before enabling DAX on the fetcher. This ensures writes populate the DAX item cache before the fetcher reads from it; reversing the order can serve stale values until the item-cache TTL expires.

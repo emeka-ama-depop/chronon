@@ -66,25 +66,31 @@ class DynamoDBBatchTableRegistryValueTest extends AnyFlatSpec with Matchers {
     enabledStore.daxEnabled shouldBe true
   }
 
+  it should "reject configured DAX endpoints without the dax scheme" in {
+    an[IllegalArgumentException] should be thrownBy new DynamoDBKVStoreImpl(
+      null.asInstanceOf[DynamoDbAsyncClient],
+      Map(KvEnableDaxArg -> "true", KvDaxEndpointArg -> "test-cluster.example.com")
+    )
+  }
+
   it should "not use DAX for metadata datasets" in {
     val enabledStore = new DynamoDBKVStoreImpl(
       null.asInstanceOf[DynamoDbAsyncClient],
       Map(KvEnableDaxArg -> "true", KvDaxEndpointArg -> "dax://test-cluster.example.com")
     )
 
-    enabledStore.isCacheEligible("FEATURE_STREAMING") shouldBe true
+    enabledStore.isCacheEligible("FEATURE") shouldBe true
     enabledStore.isCacheEligible(MetadataDataset) shouldBe false
     enabledStore.isCacheEligible(batchTableRegistry) shouldBe false
   }
 
   it should "pass the configured AWS region to DAX configuration" in {
     val expectedRegion = sys.env.getOrElse("AWS_DEFAULT_REGION", "us-west-2")
-    val store = new DynamoDBKVStoreImpl(
-      null.asInstanceOf[DynamoDbAsyncClient],
-      Map("AWS_DEFAULT_REGION" -> expectedRegion, KvDaxEndpointArg -> "dax://test-cluster.example.com")
-    )
-
     val testCredentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"))
-    store.daxConfiguration("dax://test-cluster.example.com", Some(testCredentials)).region() shouldBe Region.of(expectedRegion)
+    AwsApiImpl
+      .daxConfiguration("dax://test-cluster.example.com",
+                        Map("AWS_DEFAULT_REGION" -> expectedRegion),
+                        Some(testCredentials))
+      .region() shouldBe Region.of(expectedRegion)
   }
 }

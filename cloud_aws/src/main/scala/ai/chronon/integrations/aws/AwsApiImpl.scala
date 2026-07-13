@@ -1,15 +1,19 @@
 package ai.chronon.integrations.aws
 
 import ai.chronon.online._
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import ai.chronon.online.serde._
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration
 import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient
+import software.amazon.dax.{ClusterDaxAsyncClient, Configuration}
 
 import java.net.URI
 import java.time.Duration
 import java.util
+import java.util.concurrent.ConcurrentHashMap
+import java.util.function.Function
 
 /** Implementation of Chronon's API interface for AWS. This is a work in progress and currently just covers the
   * DynamoDB based KV store implementation.
@@ -92,7 +96,9 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
 
   }
 
-  override def genKvStore: KVStore = new DynamoDBKVStoreImpl(ddbClient, conf)
+  @transient private[aws] lazy val daxClientProvider: String => DynamoDbAsyncClient = cachedDaxClientProvider(conf)
+
+  override def genKvStore: KVStore = new DynamoDBKVStoreImpl(ddbClient, conf, Some(daxClientProvider))
 
   /** The stream decoder method in the AwsApi is currently unimplemented. This needs to be implemented before
     * we can spin up the Aws streaming Chronon stack
@@ -109,13 +115,15 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
   override def logResponse(resp: LoggableResponse): Unit = ()
 
   override def genMetricsKvStore(tableBaseName: String): KVStore = {
-    val store = new DynamoDBMetricsKVStoreImpl(new DynamoDBStatsKVStoreImpl(ddbClient, conf), tableBaseName)
+    val store =
+      new DynamoDBMetricsKVStoreImpl(new DynamoDBStatsKVStoreImpl(ddbClient, conf, Some(daxClientProvider)),
+                                     tableBaseName)
     store.create(tableBaseName)
     store
   }
 
   override def genEnhancedStatsKvStore(tableBaseName: String): KVStore =
-    new DynamoDBStatsKVStoreImpl(ddbClient, conf)
+    new DynamoDBStatsKVStoreImpl(ddbClient, conf, Some(daxClientProvider))
 }
 
 object AwsApiImpl {
@@ -133,4 +141,33 @@ object AwsApiImpl {
     sys.env
       .get(key)
       .orElse(conf.get(key))
+
+  private[aws] def daxConfiguration(endpoint: String,
+                                    conf: Map[String, String],
+                                    credentialsProvider: Option[AwsCredentialsProvider] = None): Configuration = {
+    val builder = Configuration.builder().url(DynamoDBKVStoreConstants.validateDaxEndpoint(endpoint))
+    credentialsProvider.foreach(builder.credentialsProvider)
+    getOptional("AWS_DEFAULT_REGION", conf).orElse(getOptional("AWS_REGION", conf)).foreach { region =>
+      try {
+        builder.region(Region.of(region))
+      } catch {
+        case e: IllegalArgumentException =>
+          throw new IllegalArgumentException(s"Invalid AWS region format: $region", e)
+      }
+    }
+    builder.build()
+  }
+
+  private[aws] def cachedDaxClientProvider(conf: Map[String, String]): String => DynamoDbAsyncClient = {
+    val clients = new ConcurrentHashMap[String, DynamoDbAsyncClient]()
+    val createClient = new Function[String, DynamoDbAsyncClient] {
+      override def apply(endpoint: String): DynamoDbAsyncClient = {
+        org.slf4j.LoggerFactory
+          .getLogger(classOf[AwsApiImpl])
+          .info(s"Creating DynamoDB DAX client for endpoint: $endpoint")
+        ClusterDaxAsyncClient.builder().overrideConfiguration(daxConfiguration(endpoint, conf)).build()
+      }
+    }
+    endpoint => clients.computeIfAbsent(endpoint, createClient)
+  }
 }

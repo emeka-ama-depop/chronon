@@ -5,6 +5,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model._
 
 import java.util.concurrent.CompletableFuture
+import scala.jdk.CollectionConverters._
 
 /** Wraps a DynamoDbAsyncClient to automatically prefix all table names.
   *
@@ -44,7 +45,39 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient,
     val prefixedTableName = prefixTableName(originalTableName)
     logger.debug(s"query: original table name='$originalTableName' -> prefixed table name='$prefixedTableName'")
     val prefixedRequest = request.toBuilder.tableName(prefixedTableName).build()
-    dataDelegateFor(originalTableName).query(prefixedRequest)
+    delegate.query(prefixedRequest)
+  }
+
+  /** BatchGetItem can span tables, but Chronon's item-cache reads are deliberately single-table so one
+    * table-specific DAX delegate owns the whole request. Response table names are normalized back to the
+    * unprefixed name for the KV store.
+    */
+  def batchGetItem(request: BatchGetItemRequest): CompletableFuture[BatchGetItemResponse] = {
+    val requestItems = request.requestItems().asScala
+    require(requestItems.size == 1, "PrefixedDynamoDbAsyncClient only supports single-table BatchGetItem requests")
+
+    val (originalTableName, keysAndAttributes) = requestItems.head
+    val prefixedTableName = prefixTableName(originalTableName)
+    logger.debug(s"batchGetItem: original table name='$originalTableName' -> prefixed table name='$prefixedTableName'")
+    val prefixedRequest = request.toBuilder
+      .requestItems(Map(prefixedTableName -> keysAndAttributes).asJava)
+      .build()
+
+    dataDelegateFor(originalTableName).batchGetItem(prefixedRequest).thenApply { response =>
+      val normalizedResponses = Option(response.responses())
+        .flatMap(responses => Option(responses.get(prefixedTableName)))
+        .map(items => Map(originalTableName -> items).asJava)
+        .getOrElse(Map.empty[String, java.util.List[java.util.Map[String, AttributeValue]]].asJava)
+      val normalizedUnprocessedKeys = Option(response.unprocessedKeys())
+        .flatMap(unprocessed => Option(unprocessed.get(prefixedTableName)))
+        .map(keys => Map(originalTableName -> keys).asJava)
+        .getOrElse(Map.empty[String, KeysAndAttributes].asJava)
+
+      response.toBuilder
+        .responses(normalizedResponses)
+        .unprocessedKeys(normalizedUnprocessedKeys)
+        .build()
+    }
   }
 
   def scan(request: ScanRequest): CompletableFuture[ScanResponse] = {
