@@ -45,6 +45,7 @@ Every metric is automatically tagged with the following dimensions from its `Met
 | `join` | Join name (when applicable) |
 | `team` | Team owning the entity, from metadata |
 | `production` | `"true"` or `"false"`, from metadata |
+| `branch` | Git/deploy branch for Hub-orchestrated runs (when set on `Metrics.Context`) |
 | `accuracy` | `"TEMPORAL"` or `"SNAPSHOT"` (for GroupBy contexts) |
 | `join_part_prefix` | Prefix for a specific join part |
 | `staging_query` | StagingQuery name (when applicable) |

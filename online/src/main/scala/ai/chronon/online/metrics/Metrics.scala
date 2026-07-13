@@ -65,6 +65,7 @@ object Metrics {
     val StagingQuery = "staging_query"
     val Environment = "environment"
     val Production = "production"
+    val Branch = "branch"
     val Accuracy = "accuracy"
     val Team = "team"
     val Dataset = "dataset"
@@ -177,7 +178,8 @@ object Metrics {
                      suffix: String = null,
                      dataset: String = null,
                      model: String = null,
-                     modelTransforms: String = null)
+                     modelTransforms: String = null,
+                     branch: String = null)
       extends Serializable {
 
     def withSuffix(suffixN: String): Context = copy(suffix = (Option(suffix) ++ Seq(suffixN)).mkString("."))
@@ -211,6 +213,7 @@ object Metrics {
 
       addTag(Tag.StagingQuery, stagingQuery)
       addTag(Tag.Production, production.toString)
+      addTag(Tag.Branch, branch)
       addTag(Tag.Team, team)
       addTag(Tag.Environment, environment)
       addTag(Tag.JoinPartPrefix, joinPartPrefix)
