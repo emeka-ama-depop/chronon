@@ -63,4 +63,12 @@ class TagsTest extends AnyFlatSpec {
     assertEquals(slowTags, fastTags)
   }
 
+  it should "include branch tag only when set" in {
+    val withBranch = Metrics.Context(Environment.JoinFetching, branch = "release/1.2")
+    assertEquals("release/1.2", withBranch.toTags(Metrics.Tag.Branch))
+
+    val withoutBranch = Metrics.Context(Environment.JoinFetching)
+    assertEquals(false, withoutBranch.toTags.contains(Metrics.Tag.Branch))
+  }
+
 }

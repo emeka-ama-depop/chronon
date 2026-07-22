@@ -179,6 +179,8 @@ object Metrics {
                      dataset: String = null,
                      model: String = null,
                      modelTransforms: String = null,
+                     // Set only on Orchestrator contexts. `branch` is high-cardinality; emitting it on
+                     // fetch/KVStore/streaming metrics would multiply time-series per active branch.
                      branch: String = null)
       extends Serializable {
 
